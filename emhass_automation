@@ -1,0 +1,360 @@
+alias: EMHASS Sigenergy Battery Management (Hybrid v7.6)
+description: >
+  Smart hybrid control with scoped manual override. Default to Self-Consumption.
+  Switch to Command Charging only when EMHASS plans grid import and grid buy is
+  allowed. Switch to Command Discharging when EMHASS plans grid export, even
+  during demand windows. Only send inverter commands when values differ. Narrate
+  all decisions.
+triggers:
+  - entity_id:
+      - sensor.mpc_batt_power
+      - sensor.mpc_grid_power
+    trigger: state
+conditions:
+  - condition: template
+    value_template: |
+      {{ states('sensor.mpc_batt_power') not in ['unknown','unavailable']
+         and states('sensor.mpc_grid_power') not in ['unknown','unavailable'] }}
+actions:
+  - delay: "00:00:01"
+  - variables:
+      p_batt: "{{ states('sensor.mpc_batt_power') | int(0) }}"
+      p_batt_kw: "{{ (p_batt / 1000) | round(3) }}"
+      p_grid_plan_w: "{{ states('sensor.mpc_grid_power') | int(0) }}"
+      p_grid_plan_kw: "{{ (p_grid_plan_w / 1000) | round(3) }}"
+      current_soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(0) }}"
+      battery_soc_min: "{{ states('input_number.emhass_battery_minimum_soc') | int(22) }}"
+      battery_soc_buffer: "{{ battery_soc_min + 5 }}"
+      max_charge_rate: "{{ states('sensor.sigen_plant_ess_rated_charging_power') | float(0) }}"
+      max_discharge_rate: >-
+        {{ states('sensor.sigen_plant_ess_rated_discharging_power') | float(0)
+        }}
+      dry_run: "{{ is_state('input_boolean.emhass_dry_run', 'on') }}"
+      current_mode: "{{ states('select.sigen_plant_remote_ems_control_mode') }}"
+      export_threshold_w: 200
+      import_threshold_w: 200
+      demand_window_active: "{{ is_state('binary_sensor.home_demand_window', 'on') }}"
+      grid_buy_blocked: "{{ is_state('input_boolean.allow_grid_buy', 'off') }}"
+      manual_override_active: "{{ is_state('input_boolean.manual_battery_override', 'on') }}"
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ manual_override_active }}"
+        sequence:
+          - target:
+              entity_id: input_text.emhass_branch_reason
+            data:
+              value: Manual override active → automation paused
+            action: input_text.set_value
+          - stop: true
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ p_grid_plan_w < -export_threshold_w and current_soc >
+              battery_soc_buffer }}
+        sequence:
+          - target:
+              entity_id: input_text.emhass_branch_reason
+            data:
+              value: >
+                Export Discharging (p_batt={{p_batt}}W,
+                p_grid_plan={{p_grid_plan_w}}W, SOC={{current_soc}}%,
+                dry_run={{dry_run}})
+            action: input_text.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not dry_run }}"
+                sequence:
+                  - target:
+                      entity_id: select.sigen_plant_remote_ems_control_mode
+                    data:
+                      option: Command Discharging (PV First)
+                    action: select.select_option
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_discharging_limit')
+                      | float != [p_batt_kw, max_discharge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_discharging_limit
+                    data:
+                      value: "{{ [p_batt_kw, max_discharge_rate] | min }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_charging_limit') |
+                      float != 0 }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_charging_limit
+                    data:
+                      value: 0
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_pcs_export_limitation') |
+                      float != [p_batt_kw, max_discharge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_pcs_export_limitation
+                    data:
+                      value: "{{ [p_batt_kw, max_discharge_rate] | min }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_grid_export_limitation') |
+                      float != [p_batt_kw, max_discharge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_grid_export_limitation
+                    data:
+                      value: "{{ [p_batt_kw, max_discharge_rate] | min }}"
+                    action: number.set_value
+      - conditions:
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ p_grid_plan_w > import_threshold_w }}"
+              - condition: or
+                conditions:
+                  - condition: template
+                    value_template: "{{ demand_window_active }}"
+                  - condition: template
+                    value_template: "{{ grid_buy_blocked }}"
+        sequence:
+          - target:
+              entity_id: input_text.emhass_branch_reason
+            data:
+              value: Import Charging blocked (Demand Window or Grid Buy Blocked)
+            action: input_text.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not dry_run }}"
+                sequence:
+                  - target:
+                      entity_id: select.sigen_plant_remote_ems_control_mode
+                    data:
+                      option: Maximum Self Consumption
+                    action: select.select_option
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_charging_limit') |
+                      float != max_charge_rate }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_charging_limit
+                    data:
+                      value: "{{ max_charge_rate }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_discharging_limit')
+                      | float != max_discharge_rate }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_discharging_limit
+                    data:
+                      value: "{{ max_discharge_rate }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_pcs_import_limitation') |
+                      float != 0 }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_pcs_import_limitation
+                    data:
+                      value: 0
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_grid_import_limitation') |
+                      float != 0 }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_grid_import_limitation
+                    data:
+                      value: 0
+                    action: number.set_value
+      - conditions:
+          - condition: template
+            value_template: |
+              {{ p_grid_plan_w > import_threshold_w and current_soc < 95
+                 and not demand_window_active and not grid_buy_blocked }}
+        sequence:
+          - target:
+              entity_id: input_text.emhass_branch_reason
+            data:
+              value: >
+                Import Charging (p_batt={{p_batt}}W,
+                p_grid_plan={{p_grid_plan_w}}W, SOC={{current_soc}}%,
+                dry_run={{dry_run}})
+            action: input_text.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not dry_run }}"
+                sequence:
+                  - target:
+                      entity_id: select.sigen_plant_remote_ems_control_mode
+                    data:
+                      option: Command Charging (PV First)
+                    action: select.select_option
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_charging_limit') |
+                      float != [p_grid_plan_kw, max_charge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_charging_limit
+                    data:
+                      value: "{{ [p_grid_plan_kw, max_charge_rate] | min }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_ess_max_discharging_limit')
+                      | float != 0 }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_ess_max_discharging_limit
+                    data:
+                      value: 0
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_pcs_import_limitation') |
+                      float != [p_grid_plan_kw, max_charge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_pcs_import_limitation
+                    data:
+                      value: "{{ [p_grid_plan_kw, max_charge_rate] | min }}"
+                    action: number.set_value
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states('number.sigen_plant_grid_import_limitation') |
+                      float != [p_grid_plan_kw, max_charge_rate] | min }}
+                sequence:
+                  - target:
+                      entity_id: number.sigen_plant_grid_import_limitation
+                    data:
+                      value: "{{ [p_grid_plan_kw, max_charge_rate] | min }}"
+                    action: number.set_value
+    default:
+      - target:
+          entity_id: input_text.emhass_branch_reason
+        data:
+          value: >
+            Self Consumption (p_batt={{p_batt}}W,
+            p_grid_plan={{p_grid_plan_w}}W, SOC={{current_soc}}%,
+            dry_run={{dry_run}})
+        action: input_text.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ not dry_run }}"
+            sequence:
+              - target:
+                  entity_id: select.sigen_plant_remote_ems_control_mode
+                data:
+                  option: Maximum Self Consumption
+                action: select.select_option
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_ess_max_charging_limit') | float
+                  != max_charge_rate }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_ess_max_charging_limit
+                data:
+                  value: "{{ max_charge_rate }}"
+                action: number.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_ess_max_discharging_limit') |
+                  float != max_discharge_rate }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_ess_max_discharging_limit
+                data:
+                  value: "{{ max_discharge_rate }}"
+                action: number.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_pcs_import_limitation') | float
+                  != 0 }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_pcs_import_limitation
+                data:
+                  value: 0
+                action: number.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_grid_import_limitation') | float
+                  != 0 }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_grid_import_limitation
+                data:
+                  value: 0
+                action: number.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_pcs_export_limitation') | float
+                  != 0 }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_pcs_export_limitation
+                data:
+                  value: 0
+                action: number.set_value
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ states('number.sigen_plant_grid_export_limitation') | float
+                  != 0 }}
+            sequence:
+              - target:
+                  entity_id: number.sigen_plant_grid_export_limitation
+                data:
+                  value: 0
+                action: number.set_value
+mode: restart
