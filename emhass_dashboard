@@ -1,0 +1,278 @@
+views:
+  - title: Energy Plan
+    path: energy-plan
+    type: masonry
+    cards:
+      - type: conditional
+        conditions:
+          - entity: input_boolean.manual_battery_override
+            state: 'on'
+        card:
+          type: markdown
+          content: |
+            ## 🔴 Manual Control Active
+            Mode: **{{ states('input_select.manual_control_mode') }}**
+            Target: {{ states('input_number.manual_battery_target') }} kWh
+            SOC: {{ states('sensor.sigen_plant_battery_state_of_charge') }} %
+      - type: conditional
+        conditions:
+          - entity: input_boolean.manual_battery_override
+            state: 'off'
+        card:
+          type: markdown
+          content: |
+            ## 🟢 Automation Active
+            Status: **{{ states('sensor.battery_control_status') }}**
+      - type: entities
+        title: Export Price Risk Management & Controls
+        show_header_toggle: false
+        entities:
+          - entity: input_boolean.allow_grid_buy
+            name: 'Override: Allow Grid Power Purchase 💰'
+            icon: mdi:power-plug-in
+          - entity: input_number.emhass_buy_price_threshold
+            name: Buy Price Threshold - only buy when below this ($/kWh)
+            icon: mdi:currency-usd
+          - entity: input_number.emhass_battery_minimum_soc
+            name: Battery Reserve (%) 🔋
+            icon: mdi:battery-arrow-down
+          - entity: input_number.emhass_pv_sufficiency_margin
+            name: PV Sufficiency Margin (×)
+            icon: mdi:solar-power
+          - entity: input_number.emhass_load_history_day_offset
+            name: Load Forecast History (Days Ago)
+            icon: mdi:history
+          - entity: input_number.emhass_decay_5_30_mins
+            name: 5 to 30 mins Ahead Factor (0.95)
+            icon: mdi:timer-sand
+          - entity: input_number.emhass_decay_30_90_mins
+            name: 30 to 90 mins Ahead Factor (0.8)
+            icon: mdi:timer-sand-full
+          - entity: input_number.emhass_decay_90_plus_mins
+            name: More than 90 mins Ahead Factor (0.6)
+            icon: mdi:timer-sand-empty
+          - type: attribute
+            entity: sensor.mpc_optim_status
+            name: Last Optimization Status
+            attribute: value
+            icon: mdi:check-circle-outline
+      - type: entities
+        title: 🔋 Manual Battery Control
+        show_header_toggle: false
+        entities:
+          - entity: input_select.manual_control_mode
+            name: Control Mode (Target SOC or Duration)
+            icon: mdi:gesture-tap
+          - entity: input_number.manual_battery_target
+            name: Target Battery Level (kWh)
+            icon: mdi:battery-charging-100
+          - entity: input_number.manual_duration
+            name: Duration (minutes)
+            icon: mdi:timer
+          - entity: input_select.manual_direction
+            name: Direction (Charge/Discharge)
+            icon: mdi:swap-horizontal
+          - entity: input_boolean.manual_battery_override
+            name: Manual Override Active
+            icon: mdi:toggle-switch
+          - type: call-service
+            name: ▶️ Start Manual Control
+            icon: mdi:play-circle
+            action_name: Start
+            service: script.manual_battery_dispatch
+          - type: call-service
+            name: ⏹ Cancel Manual Control
+            icon: mdi:stop-circle
+            action_name: Stop
+            service: script.cancel_manual_battery_control
+      - type: entities
+        title: PV Sufficiency Diagnostics
+        show_header_toggle: false
+        entities:
+          - entity: sensor.emhass_energy_needed_to_full
+            name: Energy Needed to Full (kWh)
+          - entity: sensor.solcast_pv_forecast_forecast_remaining_today
+            name: PV Energy Remaining (kWh)
+          - entity: input_number.emhass_pv_sufficiency_margin
+            name: Margin (×)
+          - entity: sensor.emhass_pv_sufficient
+            name: PV Sufficient?
+      - type: custom:apexcharts-card
+        experimental:
+          hidden_by_default: true
+        header:
+          show: true
+          show_states: true
+          colorize_states: true
+        graph_span: 12h
+        span:
+          start: minute
+          offset: +0h
+        all_series_config:
+          stroke_width: 2
+          group_by:
+            duration: 5min
+            func: avg
+            fill: last
+        apex_config:
+          tooltip:
+            shared: true
+            enabled: true
+          chart:
+            height: auto
+        yaxis:
+          - id: power
+            min: -25
+            max: 25
+            decimals: 1
+            apex_config:
+              title:
+                text: Power (kW)
+              forceNiceScale: true
+              tick_amount: 4
+          - id: soc
+            min: -100
+            max: 100
+            decimals: 1
+            show: false
+            apex_config:
+              title:
+                text: Battery State of Charge
+              opposite: true
+              forceNiceScale: true
+              tick_amount: 4
+          - id: price
+            min: -1
+            max: 1
+            decimals: 1
+            apex_config:
+              title:
+                text: Price ($/kWh)
+              opposite: true
+              forceNiceScale: true
+              tick_amount: 4
+        series:
+          - entity: sensor.mpc_cost_fun
+            unit: $
+            invert: true
+            float_precision: 0
+            name: Cost
+            show:
+              legend_value: false
+              in_chart: false
+            transform: return x * -1
+            yaxis_id: price
+          - entity: sensor.mpc_batt_soc
+            type: line
+            curve: straight
+            stroke_width: 4
+            stroke_dash: 4
+            color: '#00cc00'
+            extend_to: false
+            show:
+              in_header: false
+              legend_value: true
+            data_generator: |-
+              return entity.attributes.battery_scheduled_soc.map((entry) => {
+                return [new Date(entry.date), entry.mpc_batt_soc];
+              });
+            yaxis_id: soc
+          - entity: sensor.mpc_pv_power
+            curve: straight
+            type: area
+            color: '#fc0'
+            extend_to: false
+            show:
+              in_header: false
+              legend_value: true
+              in_chart: true
+            unit: kW
+            data_generator: |-
+              return entity.attributes.forecasts.map((entry) => {
+                return [new Date(entry.date), entry.mpc_pv_power/1000];
+              });
+            yaxis_id: power
+          - entity: sensor.mpc_load_power
+            curve: stepline
+            type: area
+            color: '#a0f'
+            extend_to: false
+            show:
+              in_header: false
+              legend_value: false
+            unit: kW
+            data_generator: |-
+              return entity.attributes.forecasts.map((entry) => {
+                return [new Date(entry.date), -entry.mpc_load_power/1000];
+              });
+            yaxis_id: power
+          - entity: sensor.mpc_grid_power
+            curve: stepline
+            color: '#1af'
+            type: area
+            extend_to: false
+            show:
+              in_header: false
+              legend_value: false
+            unit: kW
+            data_generator: |-
+              return entity.attributes.forecasts.map((entry) => {
+                return [new Date(entry.date), -entry.mpc_grid_power/1000];
+              });
+            yaxis_id: power
+          - entity: sensor.mpc_batt_power
+            curve: stepline
+            color: '#00bb84'
+            extend_to: false
+            show:
+              in_header: false
+              legend_value: false
+            stroke_width: 1
+            type: area
+            unit: kW
+            data_generator: |-
+              return entity.attributes.battery_scheduled_power.map((entry) => {
+                return [new Date(entry.date), -entry.mpc_batt_power/1000];
+              });
+            yaxis_id: power
+          - entity: sensor.mpc_general_price
+            float_precision: 2
+            stroke_width: 3
+            curve: straight
+            show:
+              in_header: true
+            color: '#4400ff'
+            name: Buy Price
+            data_generator: |-
+              return entity.attributes.unit_load_cost_forecasts.map((entry) => {
+                return [new Date(entry.date), entry.mpc_general_price];
+              });
+            yaxis_id: price
+          - entity: sensor.mpc_cost_fun
+            float_precision: 2
+            stroke_width: 1
+            curve: straight
+            color: '#8b0000'
+            name: Original Sell Forecast
+            show:
+              in_header: false
+            data_generator: >-
+              const data = entity.attributes.original_feed_in_price_data; if
+              (data === undefined || data === null || Object.keys(data).length
+              === 0) return []; return Object.entries(data).map(([date, price])
+              => [new Date(date), price]);
+            yaxis_id: price
+          - entity: sensor.mpc_feed_in_price
+            float_precision: 2
+            stroke_width: 3
+            curve: straight
+            show:
+              in_header: true
+            color: '#ff00ff'
+            name: Decayed Sell Price
+            data_generator: >-
+              return entity.attributes.unit_prod_price_forecasts.map((entry) =>
+              {
+                return [new Date(entry.date), entry.mpc_feed_in_price];
+              });
+            yaxis_id: price
